@@ -1,0 +1,157 @@
+-- First drop the existing functions
+DROP FUNCTION IF EXISTS public.get_home_page_events(text);
+DROP FUNCTION IF EXISTS public.get_expanded_future_events(text, text, text, date, date, date, integer, integer);
+
+-- Recreate get_home_page_events function without added_by and trust_score fields
+CREATE OR REPLACE FUNCTION public.get_home_page_events(region_filter text DEFAULT 'Vorarlberg'::text)
+ RETURNS TABLE(id text, name text, category text, subcategory text, description text, region text, subregion text, city text, host text, address text, state text, popularity_score integer, event_date date, start_time text, end_time text, image text, price_type text, price_amount numeric, link text, featured boolean, created_at timestamp with time zone, updated_at timestamp with time zone)
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  today_date date := CURRENT_DATE;
+  end_date date := CURRENT_DATE + INTERVAL '7 days';
+  where_conditions text := '';
+  date_conditions text := '';
+  full_query text;
+BEGIN
+  -- Base conditions
+  where_conditions := 'e.state = ''Approved''';
+  
+  -- Region filtering
+  IF region_filter IS NOT NULL AND region_filter != 'Vorarlberg' THEN
+    where_conditions := where_conditions || ' AND (e.region = ''' || region_filter || ''' OR e.subregion = ''' || region_filter || ''')';
+  ELSE
+    where_conditions := where_conditions || ' AND e.region = ''Vorarlberg''';
+  END IF;
+  
+  -- Date filtering for next 7 days
+  date_conditions := '(d.value->>''date'')::date >= ''' || today_date || ''' AND (d.value->>''date'')::date <= ''' || end_date || '''';
+  
+  -- Build the full query with expansion, filtering, and per-day limit
+  full_query := '
+    WITH expanded_events AS (
+      SELECT 
+        e.id::text || ''-'' || (d.value->>''date'') as id,
+        e.name,
+        e.category,
+        e.subcategory,
+        e.description,
+        e.region,
+        e.subregion,
+        e.city,
+        e.host,
+        e.address,
+        e.state,
+        e.popularity_score,
+        (d.value->>''date'')::date as event_date,
+        COALESCE(d.value->>''startTime'', '''') as start_time,
+        COALESCE(d.value->>''endTime'', '''') as end_time,
+        e.image,
+        e.price_type,
+        e.price_amount,
+        e.link,
+        e.featured,
+        e.created_at,
+        e.updated_at,
+        ROW_NUMBER() OVER (
+          PARTITION BY (d.value->>''date'')::date 
+          ORDER BY COALESCE(e.popularity_score, 0) DESC, e.created_at DESC
+        ) as day_rank
+      FROM events e
+      CROSS JOIN jsonb_array_elements(e.dates) as d
+      WHERE ' || where_conditions || ' AND ' || date_conditions || '
+    )
+    SELECT 
+      id, name, category, subcategory, description, region, subregion, city, host, address, state,
+      popularity_score, event_date, start_time, end_time, image, price_type, 
+      price_amount, link, featured, created_at, updated_at
+    FROM expanded_events
+    WHERE day_rank <= 12
+    ORDER BY event_date ASC, COALESCE(popularity_score, 0) DESC, created_at DESC';
+    
+  RETURN QUERY EXECUTE full_query;
+END;
+$function$;
+
+-- Recreate get_expanded_future_events function without added_by and trust_score fields
+CREATE OR REPLACE FUNCTION public.get_expanded_future_events(region_filter text DEFAULT 'Vorarlberg'::text, category_filter text DEFAULT NULL::text, subcategory_filter text DEFAULT NULL::text, start_date_filter date DEFAULT NULL::date, end_date_filter date DEFAULT NULL::date, single_date_filter date DEFAULT NULL::date, limit_count integer DEFAULT 100, offset_count integer DEFAULT 0)
+ RETURNS TABLE(id text, name text, category text, subcategory text, description text, region text, subregion text, city text, host text, address text, state text, popularity_score integer, event_date date, start_time text, end_time text, image text, price_type text, price_amount numeric, link text, featured boolean, created_at timestamp with time zone, updated_at timestamp with time zone, total_count bigint)
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  today_date date := CURRENT_DATE;
+  where_conditions text := '';
+  date_conditions text := '';
+  full_query text;
+BEGIN
+  -- Base conditions
+  where_conditions := 'e.state = ''Approved''';
+  
+  -- Region filtering
+  IF region_filter IS NOT NULL AND region_filter != 'Vorarlberg' THEN
+    where_conditions := where_conditions || ' AND (e.region = ''' || region_filter || ''' OR e.subregion = ''' || region_filter || ''')';
+  ELSE
+    where_conditions := where_conditions || ' AND e.region = ''Vorarlberg''';
+  END IF;
+  
+  -- Category filtering
+  IF category_filter IS NOT NULL THEN
+    where_conditions := where_conditions || ' AND e.category = ''' || category_filter || '''';
+  END IF;
+  
+  -- Subcategory filtering
+  IF subcategory_filter IS NOT NULL THEN
+    where_conditions := where_conditions || ' AND e.subcategory = ''' || subcategory_filter || '''';
+  END IF;
+  
+  -- Date filtering for expanded dates
+  date_conditions := '(d.value->>''date'')::date >= ''' || today_date || '''';
+  
+  -- Apply date range or single date filters
+  IF single_date_filter IS NOT NULL THEN
+    date_conditions := date_conditions || ' AND (d.value->>''date'')::date = ''' || single_date_filter || '''';
+  ELSIF start_date_filter IS NOT NULL AND end_date_filter IS NOT NULL THEN
+    date_conditions := date_conditions || ' AND (d.value->>''date'')::date >= ''' || start_date_filter || ''' AND (d.value->>''date'')::date <= ''' || end_date_filter || '''';
+  END IF;
+  
+  -- Build the full query with expansion and filtering
+  full_query := '
+    WITH expanded_events AS (
+      SELECT 
+        e.id::text || ''-'' || (d.value->>''date'') as id,
+        e.name,
+        e.category,
+        e.subcategory,
+        e.description,
+        e.region,
+        e.subregion,
+        e.city,
+        e.host,
+        e.address,
+        e.state,
+        e.popularity_score,
+        (d.value->>''date'')::date as event_date,
+        COALESCE(d.value->>''startTime'', '''') as start_time,
+        COALESCE(d.value->>''endTime'', '''') as end_time,
+        e.image,
+        e.price_type,
+        e.price_amount,
+        e.link,
+        e.featured,
+        e.created_at,
+        e.updated_at
+      FROM events e
+      CROSS JOIN jsonb_array_elements(e.dates) as d
+      WHERE ' || where_conditions || ' AND ' || date_conditions || '
+    ),
+    counted_events AS (
+      SELECT *, COUNT(*) OVER() as total_count
+      FROM expanded_events
+      ORDER BY event_date ASC, COALESCE(popularity_score, 0) DESC, created_at DESC
+      LIMIT ' || limit_count || ' OFFSET ' || offset_count || '
+    )
+    SELECT * FROM counted_events';
+    
+  RETURN QUERY EXECUTE full_query;
+END;
+$function$;
